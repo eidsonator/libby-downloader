@@ -30,6 +30,14 @@ interface DownloadCompleteMessage {
 
 type BackgroundMessage = DownloadProgressMessage | DownloadCompleteMessage;
 
+/** How long to wait for the iframe's first reply to an extraction request. */
+const START_TIMEOUT_MS = 10000;
+/**
+ * How long to wait after each progress update. The iframe's last step waits
+ * up to 15s for late requests, so this has to be longer than that.
+ */
+const PROGRESS_TIMEOUT_MS = 30000;
+
 export class MessageHandler {
   private uiManager: UIManager;
   private extractionTimeout: number | null = null;
@@ -69,6 +77,13 @@ export class MessageHandler {
       case MessageTypes.EXTRACTION_ERROR:
         if (error) {
           this.handleExtractionError(error);
+        }
+        break;
+
+      case MessageTypes.EXTRACTION_PROGRESS:
+        // The iframe is still seeking through parts; keep waiting
+        if (this.extractionTimeout !== null) {
+          this.armExtractionTimeout(PROGRESS_TIMEOUT_MS);
         }
         break;
 
@@ -173,20 +188,30 @@ export class MessageHandler {
       );
     }
 
+    this.armExtractionTimeout(START_TIMEOUT_MS);
+  }
+
+  /** (Re)start the extraction deadline, replacing any pending one. */
+  private armExtractionTimeout(ms: number): void {
+    if (this.extractionTimeout !== null) {
+      clearTimeout(this.extractionTimeout);
+    }
     this.extractionTimeout = window.setTimeout(() => {
+      this.extractionTimeout = null;
       const error = new TimeoutError(
         'Extraction timeout. Try playing the audiobook for a few seconds first.',
-        10000
+        ms
       );
       logger.operationFailed('Book extraction', error);
       this.uiManager.showError(error.message);
-    }, 10000);
+    }, ms);
   }
 
   private async handleExtractionSuccess(bookData: BookData): Promise<void> {
     try {
       if (this.extractionTimeout !== null) {
         clearTimeout(this.extractionTimeout);
+        this.extractionTimeout = null;
       }
 
       logger.operationComplete('Book extraction', {
@@ -256,6 +281,7 @@ export class MessageHandler {
   private handleExtractionError(error: string): void {
     if (this.extractionTimeout !== null) {
       clearTimeout(this.extractionTimeout);
+      this.extractionTimeout = null;
     }
 
     const extractionError = new ExtractionError(error);

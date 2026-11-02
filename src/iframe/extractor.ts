@@ -10,14 +10,19 @@
 import type { BookData, BookMetadata, Chapter } from '../types/extension-book';
 import { MessageTypes } from '../types/messages';
 import { isTrustedParentMessage } from '../shared/validators';
+import { PlayerUrlStore } from './player-urls';
 
 // Extend window interface for Libby-specific globals
 declare global {
   interface Window {
     BIF?: BIFObject;
     getBIF?: () => Promise<BIFObject>;
-    __odreadCmptParams: number[] | null;
   }
+}
+
+/** A position in the book: spine index plus the fraction through that part. */
+interface BIFPlace {
+  seek?: () => void;
 }
 
 /**
@@ -58,6 +63,12 @@ interface BIFObject {
         spinePosition: number;
         duration?: number;
       }>;
+      focus?: {
+        floc?: number;
+      };
+    };
+    compass?: {
+      at: (location: { floc: number }) => BIFPlace | null | undefined;
     };
   };
   root?: {
@@ -67,24 +78,28 @@ interface BIFObject {
 
 console.log('[Libby Downloader] Iframe script loaded');
 
-// Hook JSON.parse to capture crypto parameters
-const originalParse = JSON.parse;
-window.__odreadCmptParams = null;
+// Record the signed chapter URLs the player requests. Resource Timing sees
+// every request the page makes, so nothing in the page has to be patched.
+// The observer keeps recording after the timing buffer fills; the direct
+// read covers anything the observer missed.
+const playerUrls = new PlayerUrlStore(location.origin);
 
-JSON.parse = function (text: string, reviver?: (key: string, value: unknown) => unknown): unknown {
-  const result = originalParse.apply(this, [text, reviver]);
-  extractCryptoParams(result, 'JSON.parse');
-  return result;
-};
+function harvestResourceEntries(): void {
+  try {
+    playerUrls.recordEntries(performance.getEntriesByType('resource'));
+  } catch {
+    // Resource Timing unavailable: rely on the observer
+  }
+}
 
-// Hook Response.prototype.json to capture crypto parameters from fetch API responses
-// Chrome's Response.json() is native C++ and does NOT go through JSON.parse
-const originalResponseJson = Response.prototype.json;
-Response.prototype.json = async function (): Promise<unknown> {
-  const result = await originalResponseJson.call(this);
-  extractCryptoParams(result, 'Response.json');
-  return result;
-};
+try {
+  new PerformanceObserver((list) => playerUrls.recordEntries(list.getEntries())).observe({
+    type: 'resource',
+    buffered: true,
+  });
+} catch {
+  // PerformanceObserver unavailable: harvestResourceEntries() still works
+}
 
 // Listen for extraction requests
 window.addEventListener('message', async (event: MessageEvent) => {
@@ -100,9 +115,18 @@ window.addEventListener('message', async (event: MessageEvent) => {
 
   console.log('[Libby Downloader] Extraction requested');
 
+  // Gathering chapter URLs can take a minute; each update tells the parent
+  // page that extraction is still going so it doesn't time out.
+  const reportProgress = (done: number, total: number): void => {
+    window.parent.postMessage(
+      { type: MessageTypes.EXTRACTION_PROGRESS, progress: { done, total } },
+      replyOrigin
+    );
+  };
+
   try {
     // Extract book data
-    const bookData = await extractBookData();
+    const bookData = await extractBookData(reportProgress);
 
     console.log(
       `[Libby Downloader] Extraction complete: "${bookData.metadata.title}" (${bookData.chapters.length} chapters)`
@@ -131,7 +155,9 @@ window.addEventListener('message', async (event: MessageEvent) => {
 /**
  * Extract book data from BIF object
  */
-async function extractBookData(): Promise<BookData> {
+async function extractBookData(
+  onProgress: (done: number, total: number) => void
+): Promise<BookData> {
   // Get BIF object
   const BIF = await getBIF();
 
@@ -139,8 +165,8 @@ async function extractBookData(): Promise<BookData> {
     throw new Error('BIF object not found. The audiobook player may not have loaded properly.');
   }
 
-  // Wait for crypto params (polls for up to 5 seconds)
-  const odreadCmptParams = await waitForCryptoParams();
+  // Make the player request every part, so each one has a signed URL
+  await gatherPlayerUrls(BIF, onProgress);
 
   // Extract metadata (null-safe, case-insensitive with fallbacks)
   const creators = BIF.map.creator ?? [];
@@ -161,11 +187,15 @@ async function extractBookData(): Promise<BookData> {
 
   // Extract chapters with full URLs
   const chapters: Chapter[] = [];
+  const missingParts: number[] = [];
   let cumulativeTime = 0;
 
   for (const spine of BIF.objects.spool.components) {
-    const url =
-      location.origin + '/' + spine.meta.path + '?' + odreadCmptParams[spine.spinePosition];
+    const url = playerUrls.urlFor(spine.meta.path);
+    if (!url) {
+      missingParts.push(spine.meta['-odread-spine-position'] + 1);
+      continue;
+    }
 
     // Try different possible duration properties (fallback to 0 if not available)
     const duration = spine.meta['audio-duration'] || spine.meta.duration || spine.duration || 0;
@@ -179,6 +209,13 @@ async function extractBookData(): Promise<BookData> {
     });
 
     cumulativeTime += duration;
+  }
+
+  if (missingParts.length > 0) {
+    throw new Error(
+      `The player didn't load audio for part ${missingParts.join(', ')} of ` +
+        `${BIF.objects.spool.components.length}. Play the book for a few seconds and try again.`
+    );
   }
 
   // Get chapter titles from TOC
@@ -245,49 +282,80 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Extract crypto params from a parsed object (shared by JSON.parse and Response.json hooks)
+ * Wait until a check passes, polling every intervalMs, for up to timeoutMs.
  */
-function extractCryptoParams(result: unknown, source: string): void {
-  if (result && typeof result === 'object' && result !== null) {
-    const obj = result as Record<string, unknown>;
-    if (obj.b && typeof obj.b === 'object') {
-      const b = obj.b as Record<string, unknown>;
-      if (b['-odread-cmpt-params']) {
-        window.__odreadCmptParams = Array.from(b['-odread-cmpt-params'] as number[]);
-        console.log(`[Libby Downloader] Captured crypto parameters via ${source}`);
-      }
-    }
+async function waitUntil(
+  check: () => boolean,
+  timeoutMs: number,
+  intervalMs: number
+): Promise<boolean> {
+  for (let waited = 0; waited < timeoutMs; waited += intervalMs) {
+    if (check()) return true;
+    await sleep(intervalMs);
   }
+  return check();
 }
 
 /**
- * Wait for crypto parameters with polling
- * Gives Libby's player time to fetch params after playback starts
+ * Make sure the player has requested every part, so each has a signed URL.
+ *
+ * Parts the player hasn't loaded yet are reached by seeking the player to a
+ * random point inside each one, with a short random pause between seeks.
+ * The original position is restored afterwards. Parts that still have no URL
+ * are reported by the caller.
  */
-async function waitForCryptoParams(
-  timeoutMs: number = 5000,
-  pollIntervalMs: number = 250
-): Promise<number[]> {
-  if (window.__odreadCmptParams) {
-    return window.__odreadCmptParams;
+async function gatherPlayerUrls(
+  BIF: BIFObject,
+  onProgress: (done: number, total: number) => void
+): Promise<void> {
+  const components = BIF.objects.spool.components;
+  const hasUrl = (path: string): boolean => {
+    harvestResourceEntries();
+    return playerUrls.urlFor(path) !== undefined;
+  };
+
+  const missing = components.filter((c) => !hasUrl(c.meta.path));
+  if (missing.length === 0) return;
+
+  const compass = BIF.objects.compass;
+  if (!compass || typeof compass.at !== 'function') {
+    console.warn('[Libby Downloader] Player has no seek API; using only the parts already loaded');
+    return;
   }
 
-  console.log('[Libby Downloader] Waiting for crypto parameters...');
-  const maxAttempts = Math.ceil(timeoutMs / pollIntervalMs);
+  console.log(`[Libby Downloader] Seeking the player through ${missing.length} unloaded parts`);
+  const originalFloc = BIF.objects.spool.focus?.floc ?? 0;
+  const lastPosition = components.length - 1;
 
-  for (let i = 0; i < maxAttempts; i++) {
-    await sleep(pollIntervalMs);
-    if (window.__odreadCmptParams) {
-      console.log(
-        `[Libby Downloader] Crypto parameters captured after ${(i + 1) * pollIntervalMs}ms`
-      );
-      return window.__odreadCmptParams;
+  try {
+    for (let i = 0; i < missing.length; i++) {
+      const part = missing[i];
+      const position = part.meta['-odread-spine-position'];
+      onProgress(i + 1, missing.length);
+
+      // Land somewhere inside the part; stay clear of the very end of the book
+      const fraction =
+        position === lastPosition ? 0.25 + Math.random() * 0.5 : 0.01 + Math.random() * 0.98;
+      try {
+        compass.at({ floc: position + fraction })?.seek?.();
+      } catch (error) {
+        console.warn(`[Libby Downloader] Seek to part ${position + 1} failed:`, error);
+      }
+
+      await waitUntil(() => hasUrl(part.meta.path), 3000, 100);
+      if (i < missing.length - 1) await sleep(400 + Math.random() * 1200);
+    }
+
+    // Requests can land late; give stragglers a moment
+    onProgress(missing.length, missing.length);
+    await waitUntil(() => components.every((c) => hasUrl(c.meta.path)), 15000, 500);
+  } finally {
+    try {
+      compass.at({ floc: originalFloc })?.seek?.();
+    } catch (error) {
+      console.warn('[Libby Downloader] Could not restore the playback position:', error);
     }
   }
-
-  throw new Error(
-    'Crypto parameters not captured. Please play the audiobook for a few seconds and try again.'
-  );
 }
 
 /**
